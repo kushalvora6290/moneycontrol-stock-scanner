@@ -5,8 +5,8 @@ import numpy as np
 from collections import defaultdict
 
 # ================= TELEGRAM CONFIG =================
-BOT_TOKEN = "8133348298:AAGJuwWrqnF_Qu4CSdSpoovnlGU9J0F2aJw"
-CHAT_ID = "-5220624919"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -164,3 +164,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
