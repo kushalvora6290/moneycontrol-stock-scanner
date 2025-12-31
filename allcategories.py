@@ -3,6 +3,7 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 from collections import defaultdict
+import os
 
 # ================= TELEGRAM CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -164,4 +165,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
