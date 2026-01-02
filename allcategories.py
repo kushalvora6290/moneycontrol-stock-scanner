@@ -1,35 +1,21 @@
+import os
+import time
 import requests
 import pandas as pd
 import yfinance as yf
-import numpy as np
 from collections import defaultdict
-import os
 
-# ================= TELEGRAM CONFIG =================
+# =========================
+# CONFIG (GitHub Secrets)
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message
-    }
-    r = requests.post(url, json=payload)
-    return r.json()
-
-# ================= MONEYCONTROL CONFIG =================
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json"
-}
-
-APIS = {
-    "Top Gainers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/gainer",
-    "Only Buyers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/buyer",
-    "Price Shockers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/price-shocker",
-    "Volume Shockers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/volume-shocker",
-    "52 Week High": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/52-week-high"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.moneycontrol.com/",
+    "Origin": "https://www.moneycontrol.com"
 }
 
 COMMON_PARAMS = {
@@ -43,127 +29,137 @@ COMMON_PARAMS = {
     "responseType": "json"
 }
 
-# ================= FUNCTIONS =================
+APIS = {
+    "Top Gainers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/gainer",
+    "Only Buyers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/buyer",
+    "Price Shockers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/price-shocker",
+    "Volume Shockers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/volume-shocker",
+    "52 Week High": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/52-week-high",
+}
+
+# =========================
+# TELEGRAM
+# =========================
+def send_telegram(message):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("⚠ Telegram secrets missing")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(
+            url,
+            json={"chat_id": CHAT_ID, "text": message},
+            timeout=10
+        )
+    except Exception as e:
+        print("Telegram error:", e)
+
+# =========================
+# MONEYCONTROL FETCH
+# =========================
 def fetch_stocks(url):
     try:
         r = requests.get(url, headers=HEADERS, params=COMMON_PARAMS, timeout=10)
-        r.raise_for_status()
+        if r.status_code != 200 or not r.text.strip():
+            return set()
         data = r.json()
-
         return {
             item.get("symbol")
             for item in data.get("data", {}).get("list", [])
             if item.get("symbol")
         }
-    except Exception as e:
-        print("❌ API Error:", e)
+    except Exception:
         return set()
 
+# =========================
+# TECHNICALS
+# =========================
+def compute_rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-def calculate_rsi(symbol, period=14):
+# Prevent duplicate alerts (per run)
+alerted_stocks = set()
+
+def intraday_transition_alert(stock, category_count):
     try:
-        ticker = yf.Ticker(symbol + ".NS")
-        hist = ticker.history(period="2mo")
+        df = yf.download(stock + ".NS", interval="5m", period="1d", progress=False)
+        if df.empty or len(df) < 20:
+            return
 
-        if hist.empty or len(hist) < period:
-            return None
+        df["RSI"] = compute_rsi(df["Close"])
+        df["VWAP"] = (
+            df["Volume"]
+            * (df["High"] + df["Low"] + df["Close"]) / 3
+        ).cumsum() / df["Volume"].cumsum()
 
-        delta = hist["Close"].diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
+        price = df.iloc[-1]["Close"]
+        vwap = df.iloc[-1]["VWAP"]
 
-        avg_gain = gain.rolling(period).mean()
-        avg_loss = loss.rolling(period).mean()
+        rsi_now = df["RSI"].iloc[-1]
+        rsi_prev = df["RSI"].iloc[-2]
 
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
+        first_30m = df.between_time("09:15", "09:45")
+        if first_30m.empty:
+            return
 
-        return round(rsi.iloc[-1], 2)
-    except:
-        return None
+        first_high = first_30m["High"].max()
 
-# ================= MAIN =================
+        # RAW → CONFIRMED TRANSITION
+        if (
+            stock not in alerted_stocks
+            and price > vwap
+            and rsi_now > rsi_prev
+            and 55 <= rsi_now <= 75
+            and price > first_high
+        ):
+            alerted_stocks.add(stock)
+
+            send_telegram(
+                f"🚨 INTRADAY BREAKOUT ALERT\n\n"
+                f"STOCK: {stock}\n"
+                f"Categories: {category_count}\n"
+                f"RSI: {round(rsi_now, 2)}\n"
+                f"VWAP: Reclaimed\n"
+                f"Breakout: First 30-min High\n\n"
+                f"✅ ACTIONABLE NOW"
+            )
+
+    except Exception:
+        pass
+
+# =========================
+# MAIN
+# =========================
 def main():
-    stock_occurrence = defaultdict(list)
+    stock_categories = defaultdict(list)
 
-    print("\n📊 FETCHING MONEYCONTROL DATA\n")
-
+    # ---- Build RAW MOMENTUM
     for category, url in APIS.items():
         stocks = fetch_stocks(url)
-        for stock in stocks:
-            stock_occurrence[stock].append(category)
-        print(f"✅ {category}: {len(stocks)} stocks")
+        time.sleep(1.2)
+        for s in stocks:
+            stock_categories[s].append(category)
 
-    # Stocks in 2+ categories
-    multi_common = {
-        stock: cats
-        for stock, cats in stock_occurrence.items()
+    raw_list = [
+        (stock, len(cats))
+        for stock, cats in stock_categories.items()
         if len(cats) >= 2
-    }
+    ]
 
-    rows = []
-    telegram_msg = "📊 Moneycontrol Scanner Alert\n\n"
+    # ---- Send RAW snapshot once
+    if raw_list:
+        msg = "📊 Moneycontrol Intraday Scanner\n\n🔹 MARKET MOMENTUM (Raw)\n"
+        for s, c in sorted(raw_list, key=lambda x: x[1], reverse=True)[:15]:
+            msg += f"• {s} ({c})\n"
+        send_telegram(msg)
 
-    for stock, cats in multi_common.items():
-        rsi = calculate_rsi(stock)
-        strength = round(len(cats) * rsi, 2) if rsi else 0
-        
-        rows.append({
-            "Stock": stock,
-            "Categories": ", ".join(cats),
-            "Category Count": len(cats),
-            "RSI(14)": rsi,
-            "Strength Score": strength
-        })
-
-        telegram_msg += (
-            f"🔹 {stock}\n"
-            f"   Categories: {len(cats)}\n"
-            f"   RSI(14): {rsi}\n\n"
-        )
-
-    # Export CSV
-    #df = pd.DataFrame(rows).sort_values(
-    #    by=["Category Count", "RSI(14)"],
-    #    ascending=[False, True]
-    #)
-    
-    df = pd.DataFrame(rows)
-
-    df = df.sort_values(
-        by="Strength Score",
-        ascending=False
-    )
-
-    top_3 = df.head(3)
-    
-    telegram_msg_top3 = "🔥 TOP 3 STRONGEST STOCKS \n\n"
-
-    for _, row in top_3.iterrows():
-        telegram_msg_top3 += (
-            f"🏆 {row['Stock']}\n"
-            f"Categories: {row['Category Count']}\n"
-            f"RSI(14): {row['RSI(14)']}\n"
-            f"Strength: {row['Strength Score']}\n\n"
-        )
-    
-    output_file = "moneycontrol_scanner_with_RSI.csv"
-    df.to_csv(output_file, index=False)
-    print(f"\n📁 CSV Exported: {output_file}")
-
-    # Send Telegram alert
-    if rows:
-        response = send_telegram_message(telegram_msg)
-       
-        print("📩 Telegram Response:", response)
-        
-        response_top3 = send_telegram_message(telegram_msg_top3)
-       
-        print("📩 Telegram Response:", response_top3)
-    else:
-        print("ℹ️ No stocks qualified for Telegram alert")
+    # ---- Check LIVE TRANSITIONS
+    for stock, count in raw_list:
+        intraday_transition_alert(stock, count)
 
 if __name__ == "__main__":
     main()
-
-
