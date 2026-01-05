@@ -4,21 +4,18 @@ import requests
 import pandas as pd
 import yfinance as yf
 from collections import defaultdict
+from datetime import datetime
 
 # =========================
-# CONFIG (GitHub Secrets)
+# CONFIG
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# =========================
-# MONEYCONTROL CONFIG
-# =========================
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
     "Referer": "https://www.moneycontrol.com/",
-    "Origin": "https://www.moneycontrol.com"
 }
 
 COMMON_PARAMS = {
@@ -32,63 +29,50 @@ COMMON_PARAMS = {
     "responseType": "json"
 }
 
+# =========================
+# CATEGORY WEIGHTS (IMPORTANT)
+# =========================
 APIS = {
-    "Volume Shockers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/volume-shocker",
-    "Only Buyers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/buyer",
-    "Price Shockers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/price-shocker",
-    "Top Gainers": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/gainer",
-    "52 Week High": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/52-week-high"
+    "Top Gainers": (
+        "https://api.moneycontrol.com/swiftapi/v1/markets/stats/gainer", 3
+    ),
+    "Volume Shockers": (
+        "https://api.moneycontrol.com/swiftapi/v1/markets/stats/volume-shocker", 3
+    ),
+    "Price Shockers": (
+        "https://api.moneycontrol.com/swiftapi/v1/markets/stats/price-shocker", 2
+    ),
+    "Only Buyers": (
+        "https://api.moneycontrol.com/swiftapi/v1/markets/stats/buyer", 2
+    ),
+    "52 Week High": (
+        "https://api.moneycontrol.com/swiftapi/v1/markets/stats/52-week-high", 1
+    ),
 }
 
-# =========================
-# CATEGORY WEIGHTS (KEY FIX)
-# =========================
-CATEGORY_WEIGHT = {
-    "Volume Shockers": 3,
-    "Only Buyers": 3,
-    "Price Shockers": 2,
-    "Top Gainers": 1,
-    "52 Week High": 1
-}
+MIN_RAW_SCORE = 5   # replaces len(cats) >= 2
 
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram(message):
+def send_telegram(msg):
     if not BOT_TOKEN or not CHAT_ID:
-        print("⚠ Telegram credentials missing")
         return
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         requests.post(
-            url,
-            json={"chat_id": CHAT_ID, "text": message},
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg},
             timeout=10
         )
-    except Exception as e:
-        print("Telegram error:", e)
+    except:
+        pass
 
 # =========================
-# FETCH MONEYCONTROL DATA
+# UTILS
 # =========================
-def fetch_stocks(url):
-    try:
-        r = requests.get(url, headers=HEADERS, params=COMMON_PARAMS, timeout=10)
-        if r.status_code != 200:
-            return set()
+def is_weekday():
+    return datetime.now().weekday() < 5  # Mon–Fri
 
-        data = r.json()
-        return {
-            item.get("symbol")
-            for item in data.get("data", {}).get("list", [])
-            if item.get("symbol")
-        }
-    except Exception:
-        return set()
-
-# =========================
-# TECHNICAL INDICATORS
-# =========================
 def compute_rsi(close, period=14):
     delta = close.diff()
     gain = delta.where(delta > 0, 0).rolling(period).mean()
@@ -97,102 +81,133 @@ def compute_rsi(close, period=14):
     return 100 - (100 / (1 + rs))
 
 # =========================
-# INTRADAY TRANSITION LOGIC
+# MONEYCONTROL FETCH
 # =========================
-alerted_stocks = set()
-
-def intraday_transition_alert(stock, score):
+def fetch_stocks(url):
     try:
-        df = yf.download(
-            stock + ".NS",
-            interval="5m",
-            period="1d",
-            progress=False
-        )
+        r = requests.get(url, headers=HEADERS, params=COMMON_PARAMS, timeout=10)
+        data = r.json()
+        return {
+            item["symbol"]
+            for item in data.get("data", {}).get("list", [])
+            if item.get("symbol")
+        }
+    except:
+        return set()
 
-        if df.empty or len(df) < 20:
+# =========================
+# SAFE ENTRY LOGIC
+# =========================
+def safe_entry_signal(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # RSI safe zone
+    if not (55 <= last["RSI"] <= 65):
+        return None
+
+    # EMA 20
+    ema20 = df["Close"].ewm(span=20).mean().iloc[-1]
+
+    # Price near VWAP / EMA
+    if abs(last["Close"] - last["VWAP"]) > 0.3 * last["Close"] / 100 \
+       and abs(last["Close"] - ema20) > 0.3 * last["Close"] / 100:
+        return None
+
+    # Volume continuation
+    avg_vol = df["Volume"].rolling(10).mean().iloc[-2]
+    if last["Volume"] < 1.3 * avg_vol:
+        return None
+
+    # Strong breakout candle
+    body = abs(last["Close"] - last["Open"])
+    candle_range = last["High"] - last["Low"]
+
+    if last["Close"] <= prev["High"]:
+        return None
+    if body < 0.6 * candle_range:
+        return None
+
+    entry = round(last["High"], 2)
+    sl = round(min(last["Low"], last["VWAP"]), 2)
+    target = round(entry + 2 * (entry - sl), 2)
+
+    return entry, sl, target
+
+# =========================
+# INTRADAY CHECK
+# =========================
+alerted = set()
+
+def intraday_transition_alert(stock, score, categories):
+    if stock in alerted:
+        return
+
+    try:
+        df = yf.download(stock + ".NS", interval="5m", period="1d", progress=False)
+        if df.empty or len(df) < 30:
             return
 
         df["RSI"] = compute_rsi(df["Close"])
-
         df["VWAP"] = (
             df["Volume"]
             * (df["High"] + df["Low"] + df["Close"]) / 3
         ).cumsum() / df["Volume"].cumsum()
 
-        price = df["Close"].iloc[-1]
-        vwap = df["VWAP"].iloc[-1]
-        rsi_now = df["RSI"].iloc[-1]
-        rsi_prev = df["RSI"].iloc[-2]
-
-        # FIX: Correct market open (09:15–09:45 IST)
-        first_30m = df.between_time("09:15", "09:45")
-        if first_30m.empty:
+        signal = safe_entry_signal(df)
+        if not signal:
             return
 
-        first_high = first_30m["High"].max()
+        entry, sl, target = signal
+        alerted.add(stock)
 
-        # REAL INTRADAY CONFIRMATION
-        if (
-            stock not in alerted_stocks
-            and price > vwap
-            and price > first_high
-            and rsi_now > rsi_prev
-            and 55 <= rsi_now <= 75
-        ):
-            alerted_stocks.add(stock)
+        send_telegram(
+            f"🟢 SAFE INTRADAY SETUP\n\n"
+            f"Stock: {stock}\n"
+            f"Score: {score}\n"
+            f"From: {', '.join(categories)}\n\n"
+            f"Entry: {entry}\n"
+            f"SL: {sl}\n"
+            f"Target: {target}\n\n"
+            f"VWAP + RSI + Volume ✔"
+        )
 
-            send_telegram(
-                f"🚨 INTRADAY BREAKOUT ALERT\n\n"
-                f"STOCK: {stock}\n"
-                f"Strength Score: {score}\n"
-                f"RSI(14): {round(rsi_now, 2)}\n"
-                f"VWAP: Reclaimed\n"
-                f"Breakout: First 30-min High\n\n"
-                f"✅ ACTIONABLE INTRADAY"
-            )
-
-    except Exception:
+    except:
         pass
 
 # =========================
 # MAIN
 # =========================
 def main():
-    stock_categories = defaultdict(list)
+    if not is_weekday():
+        return
 
-    # ---- FETCH ALL CATEGORIES
-    for category, url in APIS.items():
+    stock_data = defaultdict(lambda: {"score": 0, "cats": []})
+
+    # Build RAW momentum (weighted)
+    for name, (url, weight) in APIS.items():
         stocks = fetch_stocks(url)
         time.sleep(1)
         for s in stocks:
-            stock_categories[s].append(category)
+            stock_data[s]["score"] += weight
+            stock_data[s]["cats"].append(name)
 
-    # ---- WEIGHTED RAW MOMENTUM
-    raw_list = []
+    raw_list = [
+        (s, d["score"], d["cats"])
+        for s, d in stock_data.items()
+        if d["score"] >= MIN_RAW_SCORE
+    ]
 
-    for stock, cats in stock_categories.items():
-        score = sum(CATEGORY_WEIGHT.get(c, 0) for c in cats)
-
-        if score >= 5 and (
-            "Volume Shockers" in cats or "Only Buyers" in cats
-        ):
-            raw_list.append((stock, score, cats))
-
-    # ---- SEND RAW SNAPSHOT
+    # Send RAW snapshot
     if raw_list:
         msg = "📊 Moneycontrol Intraday Scanner\n\n🔹 MARKET MOMENTUM (Raw)\n"
-        for stock, score, cats in sorted(raw_list, key=lambda x: x[1], reverse=True)[:15]:
-            msg += f"• {stock} | Score {score} | {', '.join(cats)}\n"
-
+        for s, sc, cats in sorted(raw_list, key=lambda x: x[1], reverse=True)[:15]:
+            msg += f"• {s} | Score {sc} | {', '.join(cats)}\n"
         send_telegram(msg)
 
-    # ---- CHECK LIVE INTRADAY TRANSITIONS
-    for stock, score, _ in raw_list:
-        intraday_transition_alert(stock, score)
+    # Live intraday transition
+    for s, sc, cats in raw_list:
+        intraday_transition_alert(s, sc, cats)
 
-# =========================
-# ENTRY POINT
-# =========================
 if __name__ == "__main__":
     main()
