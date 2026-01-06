@@ -10,8 +10,8 @@ import pytz
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = "8133348298:AAGJuwWrqnF_Qu4CSdSpoovnlGU9J0F2aJw"
-CHAT_ID = "-5220624919"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -203,3 +203,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
