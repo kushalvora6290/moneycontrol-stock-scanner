@@ -1,9 +1,10 @@
 import os
 import time
 import requests
+import pandas as pd
 import yfinance as yf
-from collections import defaultdict
 from datetime import datetime, time as dtime
+from collections import defaultdict
 import pytz
 
 # =========================
@@ -11,11 +12,28 @@ import pytz
 # =========================
 IST = pytz.timezone("Asia/Kolkata")
 
+def log(msg):
+    print(f"[DEBUG] {msg}")
+
 # =========================
 # TELEGRAM (GitHub Secrets)
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+
+def send_telegram(message):
+    if not BOT_TOKEN or not CHAT_ID:
+        log("Telegram secrets missing")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(
+            url,
+            json={"chat_id": CHAT_ID, "text": message},
+            timeout=10
+        )
+    except Exception as e:
+        log(f"Telegram error: {e}")
 
 # =========================
 # MONEYCONTROL CONFIG
@@ -23,18 +41,12 @@ CHAT_ID = os.getenv("CHAT_ID")
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json",
-    "Referer": "https://www.moneycontrol.com/",
-    "Origin": "https://www.moneycontrol.com"
+    "Referer": "https://www.moneycontrol.com/"
 }
 
 COMMON_PARAMS = {
     "deviceType": "W",
-    "appVersion": "180",
     "ex": "N",
-    "section": "overview",
-    "indexId": "7",
-    "dur": "1d",
-    "page": "1",
     "responseType": "json"
 }
 
@@ -46,17 +58,13 @@ APIS = {
     "52 Week High": "https://api.moneycontrol.com/swiftapi/v1/markets/stats/52-week-high",
 }
 
-# =========================
-# TELEGRAM SEND
-# =========================
-def send_telegram(msg):
-    if not BOT_TOKEN or not CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-    except Exception:
-        pass
+WEIGHTS = {
+    "Volume Shockers": 3,
+    "Price Shockers": 3,
+    "Top Gainers": 2,
+    "Only Buyers": 1,
+    "52 Week High": 1
+}
 
 # =========================
 # FETCH MONEYCONTROL STOCKS
@@ -76,7 +84,7 @@ def fetch_stocks(url):
         return set()
 
 # =========================
-# TECHNICAL HELPERS
+# TECHNICALS
 # =========================
 def compute_rsi(close, period=14):
     delta = close.diff()
@@ -85,140 +93,108 @@ def compute_rsi(close, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# Prevent duplicate alerts per day
-alerted_trade_ready = set()
+alerted = set()
 
-# =========================
-# INTRADAY LOGIC
-# =========================
-def intraday_check(stock, score):
+def intraday_confirmation(stock, score):
     try:
         df = yf.download(stock + ".NS", interval="5m", period="1d", progress=False)
-        if df.empty or len(df) < 20:
+        if df.empty or len(df) < 25:
             return
 
-        # Indicators
         df["RSI"] = compute_rsi(df["Close"])
         df["VWAP"] = (
-            df["Volume"] * (df["High"] + df["Low"] + df["Close"]) / 3
+            df["Volume"]
+            * (df["High"] + df["Low"] + df["Close"]) / 3
         ).cumsum() / df["Volume"].cumsum()
-        df["VOL_AVG"] = df["Volume"].rolling(20).mean()
 
-        price = df.iloc[-1]["Close"]
-        vwap = df.iloc[-1]["VWAP"]
-        rsi_now = df["RSI"].iloc[-1]
-        rsi_prev = df["RSI"].iloc[-2]
-        vol_now = df.iloc[-1]["Volume"]
-        vol_avg = df.iloc[-1]["VOL_AVG"]
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
 
-        # First 30-min range
-        first_30 = df.between_time("09:15", "09:45")
-        if first_30.empty:
+        first_30m = df.between_time("09:15", "09:45")
+        if first_30m.empty:
             return
-        first_high = first_30["High"].max()
 
-        # =========================
-        # 🟡 TIER-1: EARLY MOMENTUM
-        # =========================
-        if (
-            abs(price - vwap) / vwap <= 0.003
-            and rsi_now > rsi_prev
-            and vol_now > vol_avg
-        ):
-            send_telegram(
-                f"🟡 EARLY MOMENTUM\n\n"
-                f"{stock}\n"
-                f"Score: {score}\n"
-                f"RSI: {round(rsi_now, 2)}\n"
-                f"Price near VWAP\n"
-                f"Volume building\n\n"
-                f"👀 Watch for breakout"
-            )
+        first_high = first_30m["High"].max()
 
-        # =========================
-        # 🔴 TIER-2: TRADE READY
-        # =========================
-        if (
-            stock not in alerted_trade_ready
-            and price >= vwap * 0.998
-            and price >= first_high * 0.995
-            and 50 <= rsi_now <= 75
-            and rsi_now > rsi_prev
-            and vol_now > vol_avg
-        ):
-            alerted_trade_ready.add(stock)
+        conditions = [
+            last["Close"] > last["VWAP"],
+            last["RSI"] > prev["RSI"],
+            55 <= last["RSI"] <= 65,
+            last["Close"] > first_high
+        ]
+
+        if all(conditions) and stock not in alerted:
+            alerted.add(stock)
 
             send_telegram(
-                f"🚨 TRADE READY\n\n"
-                f"{stock}\n"
+                f"🚨 INTRADAY CONFIRMATION\n\n"
+                f"Stock: {stock}\n"
                 f"Score: {score}\n"
-                f"RSI: {round(rsi_now, 2)}\n"
+                f"RSI: {round(last['RSI'],2)}\n"
                 f"VWAP: Reclaimed\n"
-                f"30-min range pressure\n\n"
-                f"✅ Actionable setup"
+                f"Breakout: First 30-min High\n\n"
+                f"✅ SAFE INTRADAY SETUP"
             )
 
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"{stock} error: {e}")
 
 # =========================
 # MAIN
 # =========================
 def main():
     now = datetime.now(IST)
+    log(f"Running at IST: {now}")
 
-    # Weekday only
+    # Weekdays only
     if now.weekday() >= 5:
+        log("Exit: Weekend")
         return
 
-    # Market hours only
-    if now.time() < dtime(9, 15) or now.time() > dtime(15, 30):
+    # Market hours
+    if not (dtime(9, 15) <= now.time() <= dtime(15, 30)):
+        log("Exit: Outside market hours")
         return
 
-    # 15-minute slots only
-    if now.minute not in {0, 15, 30, 45}:
+    # Every 15 minutes ONLY
+    if now.minute % 15 != 0:
+        log("Exit: Not 15-minute candle")
         return
 
-    # -------------------------
-    # BUILD RAW MOMENTUM
-    # -------------------------
-    stock_scores = defaultdict(int)
-    stock_sources = defaultdict(list)
+    log("Passed time checks")
+
+    scores = defaultdict(int)
+    sources = defaultdict(list)
 
     for name, url in APIS.items():
         stocks = fetch_stocks(url)
+        log(f"{name}: {len(stocks)} stocks")
         time.sleep(1)
+
         for s in stocks:
-            weight = 2 if name in ["Volume Shockers", "Price Shockers"] else 1
-            stock_scores[s] += weight
-            stock_sources[s].append(name)
+            scores[s] += WEIGHTS[name]
+            sources[s].append(name)
 
     raw = [
-        (s, score, stock_sources[s])
-        for s, score in stock_scores.items()
-        if score >= 3
+        (s, scores[s], sources[s])
+        for s in scores
+        if scores[s] >= 4
     ]
 
+    log(f"Raw momentum count: {len(raw)}")
+
     if not raw:
-        send_telegram("⚠ No strong intraday momentum at this slot.")
+        send_telegram("⚠ No strong intraday momentum this slot.")
         return
 
-    # -------------------------
-    # SEND RAW SNAPSHOT
-    # -------------------------
     msg = "📊 Moneycontrol Intraday Scanner\n\n🔹 MARKET MOMENTUM (Raw)\n"
-    for s, score, src in sorted(raw, key=lambda x: x[1], reverse=True)[:10]:
-        msg += f"• {s} | Score {score} | {', '.join(src)}\n"
+    for s, sc, src in sorted(raw, key=lambda x: x[1], reverse=True)[:12]:
+        msg += f"• {s} | Score {sc} | {', '.join(src)}\n"
+
     send_telegram(msg)
 
-    # -------------------------
-    # CHECK INTRADAY SETUPS
-    # -------------------------
-    for s, score, _ in raw:
-        intraday_check(s, score)
+    for s, sc, _ in raw:
+        intraday_confirmation(s, sc)
 
-# =========================
-# RUN
-# =========================
 if __name__ == "__main__":
     main()
