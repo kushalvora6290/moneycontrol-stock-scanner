@@ -2,7 +2,7 @@ name: NIFTY 500 Intraday Scanner
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # Every 5 minutes (UTC)
+    - cron: "*/5 3-10 * * 1-5"   # 8:30 AM – 3:30 PM IST (safe window)
   workflow_dispatch:
 
 jobs:
