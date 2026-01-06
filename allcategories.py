@@ -1,7 +1,6 @@
 import os
 import time
 import requests
-import pandas as pd
 import yfinance as yf
 from collections import defaultdict
 from datetime import datetime, time as dtime
@@ -19,7 +18,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # =========================
-# HEADERS
+# MONEYCONTROL CONFIG
 # =========================
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -60,7 +59,7 @@ def send_telegram(msg):
         pass
 
 # =========================
-# MONEYCONTROL FETCH
+# FETCH MONEYCONTROL STOCKS
 # =========================
 def fetch_stocks(url):
     try:
@@ -77,7 +76,7 @@ def fetch_stocks(url):
         return set()
 
 # =========================
-# TECHNICALS
+# TECHNICAL HELPERS
 # =========================
 def compute_rsi(close, period=14):
     delta = close.diff()
@@ -86,52 +85,79 @@ def compute_rsi(close, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# =========================
-# INTRADAY CONFIRMATION
-# =========================
-alerted_today = set()
+# Prevent duplicate alerts per day
+alerted_trade_ready = set()
 
-def intraday_transition(stock, score):
+# =========================
+# INTRADAY LOGIC
+# =========================
+def intraday_check(stock, score):
     try:
         df = yf.download(stock + ".NS", interval="5m", period="1d", progress=False)
         if df.empty or len(df) < 20:
             return
 
+        # Indicators
         df["RSI"] = compute_rsi(df["Close"])
         df["VWAP"] = (
-            df["Volume"]
-            * (df["High"] + df["Low"] + df["Close"]) / 3
+            df["Volume"] * (df["High"] + df["Low"] + df["Close"]) / 3
         ).cumsum() / df["Volume"].cumsum()
+        df["VOL_AVG"] = df["Volume"].rolling(20).mean()
 
         price = df.iloc[-1]["Close"]
         vwap = df.iloc[-1]["VWAP"]
         rsi_now = df["RSI"].iloc[-1]
         rsi_prev = df["RSI"].iloc[-2]
+        vol_now = df.iloc[-1]["Volume"]
+        vol_avg = df.iloc[-1]["VOL_AVG"]
 
+        # First 30-min range
         first_30 = df.between_time("09:15", "09:45")
         if first_30.empty:
             return
-
         first_high = first_30["High"].max()
 
+        # =========================
+        # 🟡 TIER-1: EARLY MOMENTUM
+        # =========================
         if (
-            stock not in alerted_today
-            and price > vwap
-            and price > first_high
-            and rsi_prev < rsi_now
-            and 55 <= rsi_now <= 70
+            abs(price - vwap) / vwap <= 0.003
+            and rsi_now > rsi_prev
+            and vol_now > vol_avg
         ):
-            alerted_today.add(stock)
+            send_telegram(
+                f"🟡 EARLY MOMENTUM\n\n"
+                f"{stock}\n"
+                f"Score: {score}\n"
+                f"RSI: {round(rsi_now, 2)}\n"
+                f"Price near VWAP\n"
+                f"Volume building\n\n"
+                f"👀 Watch for breakout"
+            )
+
+        # =========================
+        # 🔴 TIER-2: TRADE READY
+        # =========================
+        if (
+            stock not in alerted_trade_ready
+            and price >= vwap * 0.998
+            and price >= first_high * 0.995
+            and 50 <= rsi_now <= 75
+            and rsi_now > rsi_prev
+            and vol_now > vol_avg
+        ):
+            alerted_trade_ready.add(stock)
 
             send_telegram(
-                f"🚨 INTRADAY BREAKOUT\n\n"
-                f"STOCK: {stock}\n"
-                f"SCORE: {score}\n"
+                f"🚨 TRADE READY\n\n"
+                f"{stock}\n"
+                f"Score: {score}\n"
                 f"RSI: {round(rsi_now, 2)}\n"
-                f"VWAP: Above\n"
-                f"Breakout: 30-min High\n\n"
-                f"⏰ {datetime.now(IST).strftime('%H:%M IST')}"
+                f"VWAP: Reclaimed\n"
+                f"30-min range pressure\n\n"
+                f"✅ Actionable setup"
             )
+
     except Exception:
         pass
 
@@ -141,19 +167,21 @@ def intraday_transition(stock, score):
 def main():
     now = datetime.now(IST)
 
-    # ---- WEEKDAY CHECK
+    # Weekday only
     if now.weekday() >= 5:
         return
 
-    # ---- MARKET HOURS CHECK
-    if now.time() < dtime(9, 30) or now.time() > dtime(15, 30):
+    # Market hours only
+    if now.time() < dtime(9, 15) or now.time() > dtime(15, 30):
         return
 
-    # ---- EXACT 15-MIN SLOT CHECK
-    allowed = {0, 15, 30, 45}
-    if now.minute not in allowed:
+    # 15-minute slots only
+    if now.minute not in {0, 15, 30, 45}:
         return
 
+    # -------------------------
+    # BUILD RAW MOMENTUM
+    # -------------------------
     stock_scores = defaultdict(int)
     stock_sources = defaultdict(list)
 
@@ -161,7 +189,8 @@ def main():
         stocks = fetch_stocks(url)
         time.sleep(1)
         for s in stocks:
-            stock_scores[s] += 2 if name in ["Volume Shockers", "Price Shockers"] else 1
+            weight = 2 if name in ["Volume Shockers", "Price Shockers"] else 1
+            stock_scores[s] += weight
             stock_sources[s].append(name)
 
     raw = [
@@ -171,17 +200,22 @@ def main():
     ]
 
     if not raw:
-        send_telegram("⚠ No strong intraday setups at this slot.")
+        send_telegram("⚠ No strong intraday momentum at this slot.")
         return
 
+    # -------------------------
+    # SEND RAW SNAPSHOT
+    # -------------------------
     msg = "📊 Moneycontrol Intraday Scanner\n\n🔹 MARKET MOMENTUM (Raw)\n"
     for s, score, src in sorted(raw, key=lambda x: x[1], reverse=True)[:10]:
         msg += f"• {s} | Score {score} | {', '.join(src)}\n"
-
     send_telegram(msg)
 
+    # -------------------------
+    # CHECK INTRADAY SETUPS
+    # -------------------------
     for s, score, _ in raw:
-        intraday_transition(s, score)
+        intraday_check(s, score)
 
 # =========================
 # RUN
