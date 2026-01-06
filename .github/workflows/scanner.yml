@@ -2,7 +2,7 @@ name: Moneycontrol Stock Scanner
 
 on:
   schedule:
-    - cron: "*/5 4-10 * * 1-5"   # Every 5 min, Mon–Fri, UTC
+    - cron: "*/5 3-10 * * 1-5"   # Every 5 min, 9:15–3:30 IST (approx)
   workflow_dispatch:
 
 jobs:
