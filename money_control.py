@@ -1,8 +1,7 @@
-import os
 import time
 import requests
-import pandas as pd
 import yfinance as yf
+import pandas as pd
 from collections import defaultdict
 from datetime import datetime
 import pytz
@@ -10,14 +9,40 @@ import pytz
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+BOT_TOKEN = "8133348298:AAGJuwWrqnF_Qu4CSdSpoovnlGU9J0F2aJw"
+CHAT_ID = "-5220624919"
+
+MAX_UNIVERSE = 50
+MAX_BUY_ALERTS = 25
+SLEEP_BETWEEN_CALLS = 0.7
 
 IST = pytz.timezone("Asia/Kolkata")
 
+# =========================
+# MONEYCONTROL (UNCHANGED)
+# =========================
+APIS = {
+    "Volume Shockers": (
+        "https://api.moneycontrol.com/swiftapi/v1/markets/stats/volume-shocker", 4
+    ),
+    "Price Shockers": (
+        "https://api.moneycontrol.com/swiftapi/v1/markets/stats/price-shocker", 4
+    ),
+    "Only Buyers": (
+        "https://api.moneycontrol.com/swiftapi/v1/markets/stats/buyer", 3
+    ),
+    "Top Gainers": (
+        "https://api.moneycontrol.com/swiftapi/v1/markets/stats/gainer", 2
+    ),
+    "52 Week High": (
+        "https://api.moneycontrol.com/swiftapi/v1/markets/stats/52-week-high", 1
+    ),
+}
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json"
+    "Accept": "application/json",
+    "Referer": "https://www.moneycontrol.com/",
 }
 
 COMMON_PARAMS = {
@@ -28,181 +53,162 @@ COMMON_PARAMS = {
     "indexId": "7",
     "dur": "1d",
     "page": "1",
-    "responseType": "json"
+    "responseType": "json",
 }
-
-APIS = {
-    "Top Gainers": ("https://api.moneycontrol.com/swiftapi/v1/markets/stats/gainer", 3),
-    "Price Shockers": ("https://api.moneycontrol.com/swiftapi/v1/markets/stats/price-shocker", 3),
-    "Volume Shockers": ("https://api.moneycontrol.com/swiftapi/v1/markets/stats/volume-shocker", 2),
-    "Only Buyers": ("https://api.moneycontrol.com/swiftapi/v1/markets/stats/buyer", 2),
-    "52 Week High": ("https://api.moneycontrol.com/swiftapi/v1/markets/stats/52-week-high", 1),
-}
-
-MAX_UNIVERSE = 120
 
 # =========================
 # TELEGRAM
 # =========================
 def send_telegram(msg):
-    if not BOT_TOKEN or not CHAT_ID:
-        return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
 # =========================
-# TIME CHECK
+# INDICATORS
 # =========================
-def market_time_ok():
-    now = datetime.now(IST)
-    if now.weekday() >= 5:
-        return False
-    if now.hour < 9 or now.hour > 15:
-        return False
-    if now.hour == 9 and now.minute < 15:
-        return False
-    if now.hour == 15 and now.minute > 30:
-        return False
-    return True
-
-# =========================
-# TECHNICALS
-# =========================
-def compute_rsi(close, period=14):
-    delta = close.diff()
+def rsi(series, period=14):
+    delta = series.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = -delta.clip(upper=0).rolling(period).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
 # =========================
-# MONEYCONTROL FETCH
-# =========================
-def fetch_stocks(url):
-    try:
-        r = requests.get(url, headers=HEADERS, params=COMMON_PARAMS, timeout=10)
-        data = r.json()
-        return {
-            item.get("symbol")
-            for item in data.get("data", {}).get("list", [])
-            if item.get("symbol")
-        }
-    except:
-        return set()
-
-# =========================
-# BUILD ACTIVE UNIVERSE
+# UNIVERSE
 # =========================
 def get_active_universe():
-    scores = defaultdict(int)
-    categories = defaultdict(list)
+    score = defaultdict(int)
+    cats = defaultdict(list)
 
-    for name, (url, weight) in APIS.items():
-        stocks = fetch_stocks(url)
-        time.sleep(0.8)
-        for s in stocks:
-            scores[s] += weight
-            categories[s].append(name)
+    for name, (url, w) in APIS.items():
+        try:
+            r = requests.get(url, headers=HEADERS, params=COMMON_PARAMS, timeout=10)
+            data = r.json().get("data", {}).get("list", [])
+            for i in data:
+                s = i.get("symbol")
+                if s:
+                    score[s] += w
+                    cats[s].append(name)
+            time.sleep(SLEEP_BETWEEN_CALLS)
+        except:
+            pass
 
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    universe = ranked[:MAX_UNIVERSE]
-
-    return universe, categories
+    ranked = sorted(score.items(), key=lambda x: x[1], reverse=True)[:MAX_UNIVERSE]
+    return ranked, cats
 
 # =========================
-# INTRADAY CHECK
+# ENTRY VALIDATION (SAFE MODE)
 # =========================
-def intraday_check(stock):
-    try:
-        df = yf.download(
-            stock + ".NS",
-            interval="1m",
-            period="1d",
-            progress=False
-        )
+def validate_entry(stock):
+    df = yf.download(
+    stock + ".NS",
+    interval="5m",
+    period="1d",
+    progress=False,
+    threads=False,
+    timeout=20
+)
 
-        # keep only last 60 minutes
-        df = df.tail(60)
 
-        if df.empty or len(df) < 30:
-            return None
 
-        df["RSI"] = compute_rsi(df["Close"])
-        df["VWAP"] = (
-            df["Volume"]
-            * (df["High"] + df["Low"] + df["Close"]) / 3
-        ).cumsum() / df["Volume"].cumsum()
-        df["VolAvg"] = df["Volume"].rolling(20).mean()
+    if df is None or df.empty or len(df) < 40:
+        return None
 
-        last = df.iloc[-1]
+    # 🔥 FIX MULTIINDEX
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-        if (
-            last["Close"] > last["VWAP"]
-            and 55 <= last["RSI"] <= 70
-            and last["Volume"] > 1.2 * last["VolAvg"]
-            and last["Close"] > last["Open"]
-        ):
-            entry = round(last["High"], 2)
-            sl = round(last["Low"], 2)
-            target = round(entry + 2 * (entry - sl), 2)
+    df["RSI"] = rsi(df["Close"])
+    df["VolAvg"] = df["Volume"].rolling(20).mean()
 
-            return entry, sl, target, round(last["RSI"], 2)
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    df["VWAP"] = (tp * df["Volume"]).cumsum() / df["Volume"].cumsum()
 
-    except:
-        pass
+    prev = df.iloc[-2]
+    last = df.iloc[-1]
 
-    return None
+    # FORCE SCALARS
+    last_close = float(last["Close"])
+    last_open  = float(last["Open"])
+    last_high  = float(last["High"])
+    last_low   = float(last["Low"])
+    last_vwap  = float(last["VWAP"])
+    last_vol   = float(last["Volume"])
+    avg_vol    = float(last["VolAvg"])
+    last_rsi   = float(last["RSI"])
+    prev_rsi   = float(prev["RSI"])
 
+    score = 0
+
+    if last_close > last_vwap:
+        score += 20
+
+    if float(prev["Close"]) < float(prev["VWAP"]) and last_close > last_vwap:
+        score += 20
+
+    if 55 <= last_rsi <= 65 and last_rsi > prev_rsi:
+        score += 15
+
+    if last_vol > 1.3 * avg_vol:
+        score += 15
+
+    if last_close > last_open:
+        score += 15
+
+    if last_close > 0.9 * df["High"].max():
+        score += 15
+
+    entry = round(last_high, 2)
+    sl = round(last_low, 2)
+    target = round(entry + 2 * (entry - sl), 2)
+
+    status = "🟢 BUY" if score >= 70 else "🟡 WAIT"
+
+    return {
+        "stock": stock,
+        "score": score,
+        "status": status,
+        "entry": entry,
+        "sl": sl,
+        "target": target,
+        "rsi": round(last_rsi, 2),
+        "vwap": round(last_vwap, 2),
+    }
+    
 # =========================
 # MAIN
 # =========================
 def main():
-    if not market_time_ok():
-        return
+    universe, cats = get_active_universe()
 
-    universe, categories = get_active_universe()
+    # RAW MOMENTUM
+    raw = "📊 Moneycontrol Momentum (RAW)\n\n"
+    for s, sc in universe:
+        raw += f"• {s} | Score {sc}\n"
+    send_telegram(raw)
 
-    if not universe:
+    # VALIDATED SETUPS
+    buys = []
+    for s, _ in universe:
+        res = validate_entry(s)
+        if res:
+            buys.append(res)
+
+    buys = sorted(buys, key=lambda x: x["score"], reverse=True)[:MAX_BUY_ALERTS]
+
+    for b in buys:
         send_telegram(
-            "📊 Intraday Scanner\n\n⚠ No active stocks from Moneycontrol."
-        )
-        return
-
-    # ---- RAW SNAPSHOT
-    msg = "📊 Moneycontrol Intraday Scanner\n\n🔹 MARKET MOMENTUM (Raw)\n"
-    for s, score in universe[:20]:
-        cats = ", ".join(categories[s])
-        msg += f"• {s} | Score {score} | {cats}\n"
-    send_telegram(msg)
-
-    # ---- INTRADAY CONFIRMATION
-    alerts = []
-
-    for s, score in universe:
-        result = intraday_check(s)
-        if result:
-            entry, sl, target, rsi = result
-            alerts.append((s, score, entry, sl, target, rsi))
-
-    if alerts:
-        msg = "🚨 INTRADAY ACTIONABLE SETUPS\n\n"
-        for s, score, e, sl, t, rsi in alerts[:5]:
-            msg += (
-                f"🔹 {s}\n"
-                f"Score: {score}\n"
-                f"Entry: {e}\n"
-                f"SL: {sl}\n"
-                f"Target: {t}\n"
-                f"RSI: {rsi}\n\n"
-            )
-        send_telegram(msg)
-    else:
-        send_telegram(
-            "⚠ No clean intraday setups yet.\n➡ Market likely choppy / waiting."
+            f"{b['status']} SETUP FOUND\n\n"
+            f"Stock: {b['stock']}\n"
+            f"Price: {b['entry']}\n"
+            f"VWAP: {b['vwap']}\n"
+            f"RSI(14): {b['rsi']}\n"
+            f"Score: {b['score']}/100\n\n"
+            f"Entry: {b['entry']}\n"
+            f"SL: {b['sl']}\n"
+            f"Target: {b['target']}\n\n"
+            f"Structure: Bullish Continuation"
         )
 
 if __name__ == "__main__":
     main()
-
-
-
