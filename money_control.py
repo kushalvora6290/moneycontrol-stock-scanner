@@ -139,7 +139,7 @@ def intraday_check(stock):
         if (
             last["Close"] > last["VWAP"]
             and 55 <= last["RSI"] <= 70
-            and last["Volume"] > 1.3 * last["VolAvg"]
+            and last["Volume"] > 1.2 * last["VolAvg"]
             and last["Close"] > last["Open"]
         ):
             entry = round(last["High"], 2)
@@ -203,5 +203,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
