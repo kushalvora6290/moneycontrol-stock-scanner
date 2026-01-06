@@ -9,8 +9,8 @@ import pytz
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = "8133348298:AAGJuwWrqnF_Qu4CSdSpoovnlGU9J0F2aJw"
-CHAT_ID = "-5220624919"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 MAX_UNIVERSE = 50
 MAX_BUY_ALERTS = 25
@@ -212,3 +212,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
