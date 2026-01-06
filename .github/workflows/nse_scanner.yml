@@ -1,0 +1,40 @@
+name: NSE 5% Momentum Scanner
+
+on:
+  schedule:
+    # 09:35 IST
+    - cron: "5 4 * * 1-5"
+    # 10:45 IST
+    - cron: "15 5 * * 1-5"
+    # 12:30 IST
+    - cron: "0 7 * * 1-5"
+    # 14:45 IST
+    - cron: "15 9 * * 1-5"
+
+  workflow_dispatch:   # Manual trigger
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run NSE Stock Scanner
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python fast_swing_scanner.py
