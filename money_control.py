@@ -170,7 +170,7 @@ def main():
 
     # ---- RAW SNAPSHOT
     msg = "📊 Moneycontrol Intraday Scanner\n\n🔹 MARKET MOMENTUM (Raw)\n"
-    for s, score in universe[:10]:
+    for s, score in universe[:20]:
         cats = ", ".join(categories[s])
         msg += f"• {s} | Score {score} | {cats}\n"
     send_telegram(msg)
@@ -203,4 +203,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
