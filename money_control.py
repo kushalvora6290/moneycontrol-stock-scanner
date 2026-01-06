@@ -1,3 +1,5 @@
+import os
+import time
 import requests
 import yfinance as yf
 import pandas as pd
@@ -253,3 +255,4 @@ def main():
 # =========================
 if __name__ == "__main__":
     main()
+
